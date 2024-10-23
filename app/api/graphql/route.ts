@@ -1,18 +1,33 @@
+import crypto from 'node:crypto';
 import { gql } from '@apollo/client';
 import { ApolloServer } from '@apollo/server';
 import { startServerAndCreateNextHandler } from '@as-integrations/next';
 import { makeExecutableSchema } from '@graphql-tools/schema';
+import bcrypt from 'bcrypt';
 import { GraphQLError } from 'graphql';
+import { cookies } from 'next/headers';
 import type { NextRequest, NextResponse } from 'next/server';
 import {
-  createAnimalInsecure,
-  deleteAnimalInsecure,
+  createAnimal,
+  deleteAnimal,
   getAnimalInsecure,
   getAnimalsInsecure,
-  updateAnimalInsecure,
+  updateAnimal,
 } from '../../../database/animals';
+import { createNote } from '../../../database/notes';
+import { createSessionInsecure } from '../../../database/sessions';
+import {
+  createUserInsecure,
+  getUserInsecure,
+  getUserWithPasswordHashInsecure,
+} from '../../../database/users';
 import type { Resolvers } from '../../../graphql/graphqlGeneratedTypes';
 import type { Animal } from '../../../migrations/00000-createTableAnimals';
+import { secureCookieOptions } from '../../../util/cookies';
+
+export type Context = {
+  sessionTokenCookie?: { value: string };
+};
 
 export type GraphqlResponseBody =
   | {
@@ -26,6 +41,17 @@ const typeDefs = gql`
     firstName: String!
     type: String!
     accessory: String
+  }
+
+  type User {
+    id: ID!
+    username: String!
+  }
+
+  type Note {
+    id: ID!
+    title: String
+    textContent: String
   }
 
   type Query {
@@ -44,6 +70,11 @@ const typeDefs = gql`
       type: String!
       accessory: String
     ): Animal
+
+    register(username: String!, password: String!): User
+    login(username: String!, password: String!): User
+
+    createNote(title: String!, textContent: String!): Note
   }
 `;
 
@@ -59,7 +90,11 @@ const resolvers: Resolvers = {
   },
 
   Mutation: {
-    createAnimal: async (parent, args) => {
+    createAnimal: async (parent, args, context) => {
+      if (!context.sessionTokenCookie) {
+        throw new GraphQLError('Unauthorized operation');
+      }
+
       if (
         typeof args.firstName !== 'string' ||
         typeof args.type !== 'string' ||
@@ -70,14 +105,18 @@ const resolvers: Resolvers = {
         throw new GraphQLError('Required field missing');
       }
 
-      return await createAnimalInsecure({
+      return await createAnimal(context.sessionTokenCookie.value, {
         firstName: args.firstName,
         type: args.type,
         accessory: args.accessory || null,
       });
     },
 
-    updateAnimal: async (parent, args) => {
+    updateAnimal: async (parent, args, context) => {
+      if (!context.sessionTokenCookie) {
+        throw new GraphQLError('Unauthorized operation');
+      }
+
       if (
         typeof args.firstName !== 'string' ||
         typeof args.type !== 'string' ||
@@ -88,7 +127,7 @@ const resolvers: Resolvers = {
         throw new GraphQLError('Required field missing');
       }
 
-      return await updateAnimalInsecure({
+      return await updateAnimal(context.sessionTokenCookie.value, {
         id: Number(args.id),
         firstName: args.firstName,
         type: args.type,
@@ -96,8 +135,134 @@ const resolvers: Resolvers = {
       });
     },
 
-    deleteAnimal: async (parent, args) => {
-      return await deleteAnimalInsecure(Number(args.id));
+    deleteAnimal: async (parent, args, context) => {
+      if (!context.sessionTokenCookie) {
+        throw new GraphQLError('Unauthorized operation');
+      }
+
+      return await deleteAnimal(
+        context.sessionTokenCookie.value,
+        Number(args.id),
+      );
+    },
+
+    register: async (parent, args) => {
+      // 1. Check if required fields are present
+      if (
+        typeof args.username !== 'string' ||
+        typeof args.password !== 'string' ||
+        !args.username ||
+        !args.password
+      ) {
+        throw new GraphQLError('Required field missing');
+      }
+
+      // 2. Check if user already exist in the database
+      const user = await getUserInsecure(args.username);
+
+      if (user) {
+        throw new GraphQLError('Username already taken');
+      }
+
+      // 3. Hash the plain password from the user
+      const passwordHash = await bcrypt.hash(args.password, 12);
+
+      // 4. Save the user information with the hashed password in the database
+      const newUser = await createUserInsecure(args.username, passwordHash);
+
+      if (!newUser) {
+        throw new GraphQLError('Registration failed');
+      }
+
+      // 5. Create a token
+      const token = crypto.randomBytes(100).toString('base64');
+
+      // 6. Create the session record
+      const session = await createSessionInsecure(token, Number(newUser.id));
+
+      if (!session) {
+        throw new GraphQLError('Sessions creation failed');
+      }
+
+      (await cookies()).set({
+        name: 'sessionToken',
+        value: session.token,
+        ...secureCookieOptions,
+      });
+
+      return newUser;
+    },
+
+    login: async (parent, args) => {
+      if (
+        typeof args.username !== 'string' ||
+        typeof args.password !== 'string' ||
+        !args.username ||
+        !args.password
+      ) {
+        throw new GraphQLError('Required field missing');
+      }
+
+      // 3. verify the user credentials
+      const userWithPasswordHash = await getUserWithPasswordHashInsecure(
+        args.username,
+      );
+
+      if (!userWithPasswordHash) {
+        throw new GraphQLError('username or password not valid');
+      }
+
+      // 4. Validate the user password by comparing with hashed password
+      const passwordHash = await bcrypt.compare(
+        args.password,
+        userWithPasswordHash.passwordHash,
+      );
+
+      if (!passwordHash) {
+        throw new GraphQLError('username or password not valid');
+      }
+
+      // 5. Create a token
+      const token = crypto.randomBytes(100).toString('base64');
+
+      // 6. Create the session record
+      const session = await createSessionInsecure(
+        token,
+        userWithPasswordHash.id,
+      );
+
+      if (!session) {
+        throw new GraphQLError('Sessions creation failed');
+      }
+
+      (await cookies()).set({
+        name: 'sessionToken',
+        value: session.token,
+        ...secureCookieOptions,
+      });
+
+      return null;
+    },
+
+    createNote: async (parent, args, context) => {
+      if (!context.sessionTokenCookie) {
+        throw new GraphQLError('You must be logged in to create a note');
+      }
+
+      if (
+        typeof args.title !== 'string' ||
+        typeof args.textContent !== 'string' ||
+        !args.title ||
+        !args.textContent
+      ) {
+        throw new GraphQLError('Required field missing');
+      }
+
+      return await createNote(
+        context.sessionTokenCookie.value,
+        args.title,
+        args.textContent,
+      );
     },
   },
 };
@@ -111,7 +276,16 @@ const apolloServer = new ApolloServer({
   schema,
 });
 
-const apolloServerRouteHandler = startServerAndCreateNextHandler(apolloServer);
+const apolloServerRouteHandler = startServerAndCreateNextHandler<NextRequest>(
+  apolloServer,
+  {
+    context: async (req) => {
+      return {
+        sessionTokenCookie: await req.cookies.get('sessionToken'),
+      };
+    },
+  },
+);
 
 // export async function GET(req: NextRequest) {
 //   return await apolloServerRouteHandler(req);
